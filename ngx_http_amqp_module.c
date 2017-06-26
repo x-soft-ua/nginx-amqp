@@ -9,6 +9,7 @@
 
 
 typedef struct{
+    ngx_uint_t amqp_echo;
     ngx_str_t amqp_ip;
     ngx_uint_t amqp_port;
     ngx_str_t amqp_exchange;
@@ -39,6 +40,14 @@ static ngx_command_t ngx_http_amqp_commands[] = {
         ngx_http_amqp,
         NGX_HTTP_LOC_CONF_OFFSET,
         0,
+        NULL
+    },
+    {
+        ngx_string("amqp_echo"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_amqp_conf_t, amqp_echo),
         NULL
     },
     {
@@ -134,7 +143,6 @@ int get_error(int x, u_char const *context, u_char* error)
 {
     if (x < 0) {
         syslog(LOG_ERR, "%s: %s\n", context, amqp_error_string2(x));
-        ngx_sprintf(error, "%s: %s\n", context, amqp_error_string2(x));
         return 1;
     }
     return 0;
@@ -149,12 +157,10 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
 
         case AMQP_RESPONSE_NONE:
         syslog(LOG_ERR, "%s: missing RPC reply type!", context);
-        ngx_sprintf(error, "%s: missing RPC reply type!\n", context);
         break;
 
         case AMQP_RESPONSE_LIBRARY_EXCEPTION:
         syslog(LOG_ERR, "%s: %s", context, amqp_error_string2(x.library_error));
-        ngx_sprintf(error, "%s: %s\n", context, amqp_error_string2(x.library_error));
         break;
 
         case AMQP_RESPONSE_SERVER_EXCEPTION:
@@ -162,10 +168,6 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
             case AMQP_CONNECTION_CLOSE_METHOD: {
                 amqp_connection_close_t *m = (amqp_connection_close_t *) x.reply.decoded;
                 syslog(LOG_ERR, "%s: server connection error %d, message: %.*s",
-                    context,
-                    m->reply_code,
-                    (int) m->reply_text.len, (char *) m->reply_text.bytes);
-                ngx_sprintf(error, "%s: server connection error %d, message: %.*s\n",
                     context,
                     m->reply_code,
                     (int) m->reply_text.len, (char *) m->reply_text.bytes);
@@ -177,15 +179,10 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
                     context,
                     m->reply_code,
                     (int) m->reply_text.len, (char *) m->reply_text.bytes);
-                ngx_sprintf(error, "%s: server channel error %d, message: %.*s\n",
-                    context,
-                    m->reply_code,
-                    (int) m->reply_text.len, (char *) m->reply_text.bytes);
                 break;
             }
             default:
             syslog(LOG_ERR, "%s: unknown server error, method id 0x%08X", context, x.reply.id);
-            ngx_sprintf(error, "%s: unknown server error, method id 0x%08X\n", context, x.reply.id);
             break;
         }
         break;
@@ -193,6 +190,28 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
 
     return 1;
 }
+
+int bind_user_queue(ngx_http_amqp_conf_t* amcf){
+    amqp_exchange_declare_ok_t *e_reply = amqp_exchange_declare(amcf->conn, 1, amqp_cstring_bytes((char*)amcf->amqp_exchange.data), amqp_cstring_bytes("direct"), 0, 0, 0, 0, amqp_empty_table);
+
+    amqp_queue_declare_ok_t *q_reply = amqp_queue_declare(amcf->conn, 1,
+        amqp_cstring_bytes((char*)amcf->amqp_queue.data), 0, 0, 0, 1,
+        amqp_empty_table);
+
+    if (q_reply == NULL || e_reply == NULL) {
+        return 0;
+    }
+
+    amqp_queue_bind(amcf->conn, 1,
+        amqp_cstring_bytes((char*)amcf->amqp_queue.data),
+        amqp_cstring_bytes((char*)amcf->amqp_exchange.data),
+        amqp_cstring_bytes((char*)amcf->amqp_queue.data),
+        amqp_empty_table);
+
+    return 1;
+}
+
+
 
 int connect_amqp(ngx_http_amqp_conf_t* amcf, u_char* error){
     int status;
@@ -217,6 +236,13 @@ int connect_amqp(ngx_http_amqp_conf_t* amcf, u_char* error){
     if(get_amqp_error(amqp_get_rpc_reply(amcf->conn), (u_char*)"Opening channel", error)){
         return -1;
     }
+    fprintf(stderr, "Connecting AMQP: %s %d [%s/%s]",  (char*)amcf->amqp_ip.data, (int)amcf->amqp_port, (char*)amcf->amqp_user.data,  (char*)amcf->amqp_password.data);
+    if (bind_user_queue(amcf) == 0) {
+        error=(u_char*)"Declaring Queue";
+        return -1;
+    }
+
+
     return 0;
 }
 
@@ -237,7 +263,6 @@ ngx_int_t ngx_http_amqp_handler(ngx_http_request_t* r){
     u_char* msg;
     u_char* msgbody;
 
-    ngx_uint_t init=amcf->init;
 
     if(amcf->lengths==NULL){
         messagebody.data=ngx_palloc(r->pool, amcf->script_source.len);
@@ -265,6 +290,7 @@ ngx_int_t ngx_http_amqp_handler(ngx_http_request_t* r){
     props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
     props.content_type = amqp_cstring_bytes("text/plain");
     props.delivery_mode = 2;
+
     if(get_error(amqp_basic_publish(amcf->conn, 1, amqp_cstring_bytes((char*)amcf->amqp_exchange.data), amqp_cstring_bytes((char*)amcf->amqp_queue.data), 0, 0, &props, amqp_cstring_bytes((char*)msgbody)), (u_char*)"Publishing", msg)){
         syslog(LOG_WARNING, "Cannot publish. Try to republish.");
         memset(msg, 0, sizeof(msg)+1);
@@ -274,16 +300,14 @@ ngx_int_t ngx_http_amqp_handler(ngx_http_request_t* r){
         }
 
     }
-    ngx_sprintf(msg, "NO ERROR init=%d", init);
-
 
     r->headers_out.content_type_len = sizeof("text/html") - 1;
     r->headers_out.content_type.data = (u_char *) "text/html";
 
 
     response.data=ngx_palloc(r->pool, 4096);
-    ngx_sprintf(response.data, "%s::%s\nmessagebody: %s\n%s\n", amcf->amqp_exchange.data, amcf->amqp_queue.data, msgbody, msg);
-    response.len=ngx_strlen(response.data);
+    ngx_sprintf(response.data, "Ok\n");
+    response.len=3;
 
     b=ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
     if(b==NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
